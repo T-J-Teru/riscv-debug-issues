@@ -1,0 +1,153 @@
+* How To Reproduce
+
+  Ensure the 32-bit RiscV ELF tools are in your =$PATH= and run =make=.
+  The =Makefile= expects to find =riscv32-unknown-elf-gcc= and
+  =riscv32-unknown-elf-gdb=.
+
+  I've not testing this bug on 64-bit tools yet, but it doesn't feel
+  like it should be 32-bit specific and will probably reproduce there
+  too.
+
+  The =Makefile= will build the test binary, and run =gdb=, at the end of
+  the =gdb= output you'll see this:
+
+  #+BEGIN_EXAMPLE
+    Breakpoint 1, foo (arg=2222) at mi-dprintf.c:30
+    30        g *= 2; /* set dprintf 1 here */
+    +print arg
+    $2 = 2222
+    +print arg == 1235
+    $3 = 0
+    +quit
+  #+END_EXAMPLE
+
+  The check for =arg= being =1235= at the end of the output should be
+  true, and is on =x86-64=, this is the bug.
+
+* Description Of Bug
+
+  This test is based on gdb.mi/mi-dprintf.exp from the GDB testsuite.
+
+  Within a function GDB tries to print a command line argument, and
+  gets the wrong result.
+
+  Here's the function:
+
+  #+BEGIN_SRC c
+    void
+    foo (int arg)
+    {
+      g += arg;
+      g *= 2;      /* Line #30, this is where we stop.  */
+      g /= 2.5;
+    }
+  #+END_SRC
+
+  At the place we stop the test tries to print =arg=, and GDB gives the
+  wrong answer.
+
+  Remember that the test is compiled at =-O0=.
+
+  Now clearly, at the place we've stopped =arg= is no longer required,
+  and so could have been optimised away.  However, this is =-O0= so, I'd
+  actually expect GCC /not/ to have optimised the variable out at this
+  point, and for the value still to be recoverable.  That's certainly
+  the case on x86-64, and GCC seems to even go to special effort to
+  write the argument to the stack.
+
+  However, if we take the position that =arg= can, and therefore should
+  be optimised out (even at =-O0=), I think GCC is still getting things
+  wrong here.  GCC claims that =arg= is in one location for the lifetime
+  of =foo=, even though that location is reused, which is why GDB gives
+  the wrong result.
+
+  Here's the DWARF for =foo=:
+
+  #+BEGIN_EXAMPLE
+    <1><a11>: Abbrev Number: 34 (DW_TAG_subprogram)
+       <a12>   DW_AT_external    : 1
+       <a12>   DW_AT_name        : foo
+       <a16>   DW_AT_decl_file   : 2
+       <a17>   DW_AT_decl_line   : 27
+       <a18>   DW_AT_decl_column : 1
+       <a19>   DW_AT_prototyped  : 1
+       <a19>   DW_AT_low_pc      : 0x10230
+       <a1d>   DW_AT_high_pc     : 0x78
+       <a21>   DW_AT_frame_base  : 1 byte block: 9c        (DW_OP_call_frame_cfa)
+       <a23>   DW_AT_GNU_all_tail_call_sites: 1
+       <a23>   DW_AT_sibling     : <0xa36>
+    <2><a27>: Abbrev Number: 37 (DW_TAG_formal_parameter)
+       <a28>   DW_AT_name        : arg
+       <a2c>   DW_AT_decl_file   : 2
+       <a2d>   DW_AT_decl_line   : 27
+       <a2e>   DW_AT_decl_column : 10
+       <a2f>   DW_AT_type        : <0x87>
+       <a33>   DW_AT_location    : 1 byte block: 5e        (DW_OP_reg14 (a4))
+    <2><a35>: Abbrev Number: 0
+    <1><a36>: Abbrev Number: 38 (DW_TAG_subprogram)
+       <a37>   DW_AT_name        : (indirect string, offset: 0xfb4): gdb_unbuffer_output
+       <a3b>   DW_AT_decl_file   : 1
+       <a3c>   DW_AT_decl_line   : 26
+       <a3d>   DW_AT_decl_column : 1
+       <a3e>   DW_AT_prototyped  : 1
+       <a3e>   DW_AT_type        : <0x87>
+       <a42>   DW_AT_low_pc      : 0x101ac
+       <a46>   DW_AT_high_pc     : 0x84
+       <a4a>   DW_AT_frame_base  : 1 byte block: 9c        (DW_OP_call_frame_cfa)
+       <a4c>   DW_AT_GNU_all_tail_call_sites: 1
+  #+END_EXAMPLE
+
+  And here's the disassembly for =foo=:
+
+  #+BEGIN_EXAMPLE
+    00010230 <foo>:
+       10230:       ff010113                addi    sp,sp,-16
+       10234:       00112623                sw      ra,12(sp)
+       10238:       00812423                sw      s0,8(sp)
+       1023c:       01010413                addi    s0,sp,16
+       10240:       00050713                mv      a4,a0
+       10244:       89c1a783                lw      a5,-1892(gp) # 1da4c <g>
+       10248:       00f70733                add     a4,a4,a5
+       1024c:       88e1ae23                sw      a4,-1892(gp) # 1da4c <g>
+       10250:       89c1a783                lw      a5,-1892(gp) # 1da4c <g>   /* Line #30, this is where we stop.  */
+       10254:       00179713                slli    a4,a5,0x1
+       10258:       88e1ae23                sw      a4,-1892(gp) # 1da4c <g>
+       1025c:       89c1a783                lw      a5,-1892(gp) # 1da4c <g>
+       10260:       00078513                mv      a0,a5
+       10264:       185000ef                jal     ra,10be8 <__floatsidf>
+       10268:       0001c7b7                lui     a5,0x1c
+       1026c:       1c07a603                lw      a2,448(a5) # 1c1c0 <__trunctfdf2+0x380>
+       10270:       1c47a683                lw      a3,452(a5)
+       10274:       104000ef                jal     ra,10378 <__divdf3>
+       10278:       00050793                mv      a5,a0
+       1027c:       00058813                mv      a6,a1
+       10280:       00078513                mv      a0,a5
+       10284:       00080593                mv      a1,a6
+       10288:       0e1000ef                jal     ra,10b68 <__fixdfsi>
+       1028c:       00050713                mv      a4,a0
+       10290:       88e1ae23                sw      a4,-1892(gp) # 1da4c <g>
+       10294:       00000013                nop
+       10298:       00c12083                lw      ra,12(sp)
+       1029c:       00812403                lw      s0,8(sp)
+       102a0:       01010113                addi    sp,sp,16
+       102a4:       00008067                ret
+  #+END_EXAMPLE
+
+  I've marked the breakpoint location on to the assembler code, this
+  corresponds to the breakpoint location marked onto the source code
+  at the start of this document.
+
+  Notice at address =0x10248= the reuse of =a4= to hold the result of
+  adding =arg= and =g= together.
+
+* Desired Resolution
+
+  I think the ideal fix would be that at =-O0= the =arg= is written to the
+  stack, and the DWARF changes to reflect this location, this would
+  make the argument available for the lifetime of the function, which
+  would give the best debugging experience.
+
+  At higher optimisation levels, and at =-O0= if the store to the stack
+  can't be achieved, then we should ensure that the location of =arg= is
+  updated to mark =arg= as no longer available once its location has
+  been reused.
